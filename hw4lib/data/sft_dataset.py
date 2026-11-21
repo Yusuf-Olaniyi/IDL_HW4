@@ -39,19 +39,38 @@ class SFTDataset(Dataset):
         """Return shifted input_ids and labels; supervise response and EOS only."""
         # TODO: Join prompt, response, and EOS. Shift once for next-token prediction.
         # The first response target sits at index len(prompt) - 1.
-        raise NotImplementedError("Complete _make_example")
+        tokens = torch.tensor(
+            list(prompt) + list(answer) + [self.tokenizer.eos_id], dtype=torch.long
+        )
+        input_ids = tokens[:-1].clone()
+        labels = tokens[1:].clone()
+        # Targets that are still prompt tokens are context, not supervision.
+        # labels[len(prompt) - 1] is the first response token and stays supervised.
+        labels[: len(prompt) - 1] = -100
+        return {"input_ids": input_ids, "labels": labels}
 
     def __len__(self):
         # TODO: Return the number of prompt/response pairs.
-        raise NotImplementedError("Complete __len__")
+        return len(self.examples)
 
     def __getitem__(self, index):
         # TODO: Return one example without allowing the caller to alter stored tensors.
-        raise NotImplementedError("Complete __getitem__")
+        example = self.examples[index]
+        return {key: value.clone() for key, value in example.items()}
 
     def collate_fn(self, examples):
         """Right-pad inputs with EOS, and labels with -100 (not EOS)."""
         if not examples:
             raise ValueError("Cannot collate an empty batch")
         # TODO: Pad each field to the longest example in this batch.
-        raise NotImplementedError("Complete collate_fn")
+        input_ids = pad_sequence(
+            [example["input_ids"] for example in examples],
+            batch_first=True,
+            padding_value=self.tokenizer.eos_id,
+        )
+        labels = pad_sequence(
+            [example["labels"] for example in examples],
+            batch_first=True,
+            padding_value=-100,
+        )
+        return {"input_ids": input_ids.long(), "labels": labels.long()}

@@ -24,11 +24,26 @@ class LoRALinear(nn.Module):
         self.dropout = nn.Dropout(dropout)
         # TODO: Create trainable A and B on the base weight's device and dtype.
         # Initialize A, zero B, and freeze the original projection.
-        raise NotImplementedError("Complete LoRALinear.__init__")
+        weight = base.weight
+        # A: (rank, in_features), Kaiming-uniform; B: (out_features, rank), zeros.
+        # Factory methods keep the base weight's device and dtype.
+        self.lora_A = nn.Parameter(weight.new_empty(rank, base.in_features))
+        self.lora_B = nn.Parameter(weight.new_zeros(base.out_features, rank))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        # Freeze the original projection (weight and optional bias).
+        for parameter in self.base.parameters():
+            parameter.requires_grad_(False)
+
+    @property
+    def scaling(self):
+        return self.alpha / self.rank
 
     def forward(self, x):
         # TODO: Add the scaled low-rank update to the original linear output.
-        raise NotImplementedError("Complete LoRALinear.forward")
+        base_output = self.base(x)
+        low_rank = F.linear(self.dropout(x), self.lora_A)   
+        update = F.linear(low_rank, self.lora_B)            
+        return base_output + self.scaling * update
 
 
 def inject_lora(model, *, rank, alpha, dropout, targets=("q_proj", "v_proj")):
@@ -40,7 +55,44 @@ def inject_lora(model, *, rank, alpha, dropout, targets=("q_proj", "v_proj")):
         raise ValueError("LoRA is already installed")
     # TODO: Find nn.Linear leaves whose names match targets; reject any unmatched target.
     # Build replacements before modifying the model. Freeze base parameters.
-    raise NotImplementedError("Complete inject_lora")
+    if (
+        isinstance(targets, str)
+        or not targets
+        or any(not isinstance(t, str) or not t for t in targets)
+    ):
+        raise ValueError("targets must be a nonempty sequence of projection names")
+    targets = tuple(targets)
+
+    # Find nn.Linear modules whose final path component is a requested target.
+    matches = [
+        (name, module)
+        for name, module in model.named_modules()
+        if isinstance(module, nn.Linear) and name.rsplit(".", 1)[-1] in targets
+    ]
+    matched_targets = {name.rsplit(".", 1)[-1] for name, _ in matches}
+    missing_targets = set(targets) - matched_targets
+    if missing_targets:
+        raise ValueError(
+            f"No linear projections found for targets: {sorted(missing_targets)}"
+        )
+
+    # Build every replacement before mutating the model.
+    replacements = [
+        (name, LoRALinear(base=module, rank=rank, alpha=alpha, dropout=dropout))
+        for name, module in matches
+    ]
+
+    # Freeze everything, then install adapters and re-enable only A and B.
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    for name, replacement in replacements:
+        parent_path, _, leaf_name = name.rpartition(".")
+        parent = model.get_submodule(parent_path) if parent_path else model
+        setattr(parent, leaf_name, replacement)
+        replacement.lora_A.requires_grad_(True)
+        replacement.lora_B.requires_grad_(True)
+
+    return [name for name, _ in matches]
 
 
 def _adapter_config(model):

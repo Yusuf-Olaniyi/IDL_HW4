@@ -25,7 +25,7 @@ class SFTTrainer(BaseTrainer):
         self.amp_enabled = bool(config["training"].get("amp", True)) and torch.device(self.device).type == "cuda"
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
         # TODO: Use summed cross-entropy, ignoring labels equal to -100.
-        self.criterion = None  # TODO
+        self.criterion = nn.CrossEntropyLoss(ignore_index=-100, reduction="sum")  # TODO
 
     def _init_experiment(self, run_name, config_file):
         """Provided: use a new output directory, or explicitly resume an existing run."""
@@ -120,13 +120,82 @@ class SFTTrainer(BaseTrainer):
         # Provided: keep this call when implementing the training loop.
         self._bind_model_to_active_wandb()
         # TODO: Implement one training epoch using the instructions above.
-        raise NotImplementedError("Complete _train_epoch")
+        if self.optimizer is None:
+            raise ValueError("Optimizer is not initialized")
+        num_batches = len(dataloader)
+        if num_batches == 0:
+            raise ValueError("Training dataloader must contain at least one batch")
+        accumulation = self.config["training"].get("gradient_accumulation_steps", 1)
+        if not isinstance(accumulation, int) or isinstance(accumulation, bool) or accumulation <= 0:
+            raise ValueError("gradient_accumulation_steps must be a positive integer")
+        clip = float(self.config["training"].get("gradient_clip", 1.0))
+        if not math.isfinite(clip) or clip <= 0:
+            raise ValueError("gradient_clip must be finite and positive")
+
+        self.model.train()
+        self.optimizer.zero_grad()
+        device_type = torch.device(self.device).type
+        total_loss, total_tokens, cycle_tokens = 0.0, 0, 0
+
+        bar = tqdm(total=num_batches, dynamic_ncols=True, leave=False, desc="[SFT train]")
+        for index, batch in enumerate(dataloader):
+            inputs, labels, count = self._batch(batch)
+            with torch.autocast(device_type=device_type, dtype=torch.float16,
+                                enabled=self.amp_enabled):
+                logits, _ = self.model(inputs)
+                # Summed CE over response (and EOS) targets only
+                loss = self.criterion(
+                    logits.reshape(-1, logits.size(-1)).float(), labels.reshape(-1)
+                )
+            if not torch.isfinite(loss):
+                raise FloatingPointError("Non-finite training loss")
+
+            self.scaler.scale(loss).backward()
+            total_loss += loss.item()
+            total_tokens += count
+            cycle_tokens += count
+
+            if (index + 1) % accumulation == 0 or index + 1 == num_batches:
+                # Unscale, then convert summed grads to per-token mean grads.
+                self.scaler.unscale_(self.optimizer)
+                for parameter in self.model.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad.div_(cycle_tokens)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip)
+
+                old_scale = self.scaler.get_scale()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                if self.scaler.get_scale() >= old_scale:
+                    self.global_optimizer_step += 1
+                    if self.scheduler is not None:
+                        self.scheduler.step()
+                self.optimizer.zero_grad()
+                cycle_tokens = 0
+
+            bar.set_postfix(response_ce=f"{total_loss / total_tokens:.4f}")
+            bar.update()
+        bar.close()
+        return self._metrics(total_loss, total_tokens), {}
 
     @torch.inference_mode()
     def _validate_epoch(self, dataloader):
         """Compute response CE from total NLL / total supervised tokens."""
         # TODO: Evaluate without gradients; exclude prompt and padding targets.
-        raise NotImplementedError("Complete _validate_epoch")
+        self.model.eval()
+        device_type = torch.device(self.device).type
+        total_loss, total_tokens = 0.0, 0
+        for batch in tqdm(dataloader, dynamic_ncols=True, leave=False, desc="[SFT dev CE]"):
+            inputs, labels, count = self._batch(batch)
+            with torch.autocast(device_type=device_type, dtype=torch.float16,
+                                enabled=self.amp_enabled):
+                logits, _ = self.model(inputs)
+            loss = self.criterion(
+                logits.reshape(-1, logits.size(-1)).float(), labels.reshape(-1)
+            )
+            total_loss += loss.item()
+            total_tokens += count
+        return self._metrics(total_loss, total_tokens)
 
     @torch.inference_mode()
     def generate(self, records):
@@ -136,7 +205,36 @@ class SFTTrainer(BaseTrainer):
         Limit total context and stop at generated EOS, excluding prompt text.
         """
         # TODO: Use SequenceGenerator and the model's score/score_cached methods.
-        raise NotImplementedError("Complete generate")
+        self.model.eval()
+        budget = self.config.get("generation", {}).get("max_new_tokens", 128)
+        if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
+            raise ValueError("generation.max_new_tokens must be a positive integer")
+        max_len = self.model.max_len
+        cache_fn = self.model.score_cached if getattr(self.model, "use_rope", False) else None
+
+        predictions = []
+        for record in tqdm(records, dynamic_ncols=True, leave=False, desc="[SFT generate]"):
+            # Prompt from the triples only; references are never appended.
+            prompt_ids = self.tokenizer.encode(format_webnlg_prompt(record["triples"]))
+            if not prompt_ids or len(prompt_ids) >= max_len:
+                raise ValueError(
+                    f"Prompt for {record.get('id')} is empty or does not fit context {max_len}"
+                )
+            prompt = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
+            decoder = SequenceGenerator(
+                score_fn=self.model.score,
+                tokenizer=self.tokenizer,
+                max_length=min(max_len, len(prompt_ids) + budget),
+                device=self.device,
+                cache_score_fn=cache_fn,
+            )
+            sequences, _ = decoder.generate_greedy(prompt)
+            sequence = decoder.post_process_sequence(
+                sequences[0], self.tokenizer, start_index=len(prompt_ids)
+            )
+            generated = sequence[len(prompt_ids):].tolist()
+            predictions.append(self.tokenizer.decode(generated, skip_special_tokens=True).strip())
+        return predictions
 
     def evaluate(self, dataloader, records=None):
         """Provided: combine teacher-forced response loss with generated-text metrics."""
@@ -155,4 +253,28 @@ class SFTTrainer(BaseTrainer):
         Log token loss and generation scores as different quantities.
         """
         # TODO: Run training/evaluation, update best Kaggle score, log, and save checkpoints.
-        raise NotImplementedError("Complete train")
+        if not dev_records:
+            raise ValueError("dev_records must contain at least one input")
+        epochs = self.config["training"]["epochs"]
+        for epoch in range(self.current_epoch, epochs):
+            sampler = getattr(train_dataloader, "sampler", None)
+            if hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch)
+
+            train_metrics, _ = self._train_epoch(train_dataloader)
+            dev_metrics = self.evaluate(val_dataloader, dev_records)
+
+            # Select on generated dev Kaggle score, (BLEU + ROUGE-L) / 2.
+            improved = dev_metrics["kaggle_score"] > self.best_metric
+            if improved:
+                self.best_metric = dev_metrics["kaggle_score"]
+            self._log_metrics({"train": train_metrics, "dev": dev_metrics}, epoch + 1)
+            self.current_epoch = epoch + 1
+
+            if improved:
+                self.save_checkpoint("best.pth")
+            self.save_checkpoint("last.pth")
+            (self.expt_root / "history.json").write_text(
+                json.dumps(self.training_history, indent=2, default=float)
+            )
+

@@ -211,6 +211,7 @@ class SFTTrainer(BaseTrainer):
             raise ValueError("generation.max_new_tokens must be a positive integer")
         max_len = self.model.max_len
         cache_fn = self.model.score_cached if getattr(self.model, "use_rope", False) else None
+        repeat_penalty = float(self.config.get("generation", {}).get("repeat_penalty", 1.0))
 
         predictions = []
         for record in tqdm(records, dynamic_ncols=True, leave=False, desc="[SFT generate]"):
@@ -228,7 +229,8 @@ class SFTTrainer(BaseTrainer):
                 device=self.device,
                 cache_score_fn=cache_fn,
             )
-            sequences, _ = decoder.generate_greedy(prompt)
+            sequences, _ = decoder.generate_greedy(prompt, repeat_penalty=repeat_penalty)
+            
             sequence = decoder.post_process_sequence(
                 sequences[0], self.tokenizer, start_index=len(prompt_ids)
             )

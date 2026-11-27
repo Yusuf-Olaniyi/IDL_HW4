@@ -204,23 +204,50 @@ class SFTTrainer(BaseTrainer):
         Do not append references to prompts. Decode one unpadded prompt at a time.
         Limit total context and stop at generated EOS, excluding prompt text.
         """
-        # TODO: Use SequenceGenerator and the model's score/score_cached methods.
         self.model.eval()
-        budget = self.config.get("generation", {}).get("max_new_tokens", 128)
+        generation = self.config.get("generation", {})
+        budget = generation.get("max_new_tokens", 128)
         if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
             raise ValueError("generation.max_new_tokens must be a positive integer")
         max_len = self.model.max_len
         cache_fn = self.model.score_cached if getattr(self.model, "use_rope", False) else None
-        repeat_penalty = float(self.config.get("generation", {}).get("repeat_penalty", 1.0))
+        repeat_penalty = float(generation.get("repeat_penalty", 1.0))
+
+        # Optional deterministic beam search + entity-coverage reranking (beam_width 1 = greedy).
+        beam_width = int(generation.get("beam_width", 1))
+        if beam_width > 1:
+            from ..decoding.beam_rerank import beam_search, rerank
+
+        # Optional delexicalisation: names -> ENT1, ENT2, ... in the triples; restored after generation.
+        use_delex = bool(self.config.get("delex", {}).get("enabled", False))
+        if use_delex:
+            from ..data.delex import delex_triples, relex
 
         predictions = []
         for record in tqdm(records, dynamic_ncols=True, leave=False, desc="[SFT generate]"):
+            triples, mapping = (delex_triples(record["triples"]) if use_delex
+                                else (record["triples"], None))
             # Prompt from the triples only; references are never appended.
-            prompt_ids = self.tokenizer.encode(format_webnlg_prompt(record["triples"]))
+            prompt_ids = self.tokenizer.encode(format_webnlg_prompt(triples))
             if not prompt_ids or len(prompt_ids) >= max_len:
                 raise ValueError(
                     f"Prompt for {record.get('id')} is empty or does not fit context {max_len}"
                 )
+            if beam_width > 1:
+                candidates = beam_search(
+                    self.model, prompt_ids, self.tokenizer.eos_id,
+                    beam_width=beam_width, max_new_tokens=budget, max_len=max_len,
+                    no_repeat_ngram_size=int(generation.get("no_repeat_ngram_size", 0)),
+                    min_new_tokens=int(generation.get("min_new_tokens", 0)),
+                    length_penalty=float(generation.get("length_penalty", 1.0)),
+                    device=self.device,
+                )
+                texts = [(self.tokenizer.decode(ids, skip_special_tokens=True).strip(), score)
+                         for ids, score in candidates]
+                text = rerank(texts, triples) if generation.get("rerank", True) else texts[0][0]
+                predictions.append(relex(text, mapping) if use_delex else text)
+                continue
+
             prompt = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
             decoder = SequenceGenerator(
                 score_fn=self.model.score,
@@ -230,12 +257,12 @@ class SFTTrainer(BaseTrainer):
                 cache_score_fn=cache_fn,
             )
             sequences, _ = decoder.generate_greedy(prompt, repeat_penalty=repeat_penalty)
-            
             sequence = decoder.post_process_sequence(
                 sequences[0], self.tokenizer, start_index=len(prompt_ids)
             )
             generated = sequence[len(prompt_ids):].tolist()
-            predictions.append(self.tokenizer.decode(generated, skip_special_tokens=True).strip())
+            text = self.tokenizer.decode(generated, skip_special_tokens=True).strip()
+            predictions.append(relex(text, mapping) if use_delex else text)
         return predictions
 
     def evaluate(self, dataloader, records=None):
